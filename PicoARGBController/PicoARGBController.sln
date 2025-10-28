@@ -1,0 +1,25 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.14.36429.23
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "PicoARGBControl", "PicoARGBControl.csproj", "{45D4DBEF-845C-92D4-4F3C-F6FAB8498270}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{45D4DBEF-845C-92D4-4F3C-F6FAB8498270}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{45D4DBEF-845C-92D4-4F3C-F6FAB8498270}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{45D4DBEF-845C-92D4-4F3C-F6FAB8498270}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{45D4DBEF-845C-92D4-4F3C-F6FAB8498270}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {7C94906C-9873-46BD-BB50-7125C6928A97}
+	EndGlobalSection
+EndGlobal
