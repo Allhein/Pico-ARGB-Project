@@ -1,0 +1,25 @@
+build
+!.vscode/*
+
+# .NET / WPF
+bin/
+obj/
+*.user
+*.suo
+.vs/
+
+# Pico SDK / CMake
+build/
+*.elf
+*.uf2
+*.bin
+*.hex
+*.map
+compile_commands.json
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+
+# Logs
+*.log
+hid_commands.log
