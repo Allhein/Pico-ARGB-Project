@@ -2,7 +2,7 @@
 
 **Pico ARGB Project** es un proyecto experimental para utilizar un microcontrolador **Raspberry Pi Pico / RP2040** como controlador ARGB externo para ventiladores y tiras LED compatibles con señal tipo **WS2812/ARGB**.
 
-El proyecto nació por la necesidad de controlar la iluminación de ventiladores **Aigo AR12** cuando no se cuenta con un controlador ARGB dedicado. Partiendo de eso se me ocurrio usar el RP2040 como una alternativa económica, programable y personalizable para enviar efectos de iluminación y comandos desde una aplicación de PC.
+El proyecto nació por la necesidad de controlar la iluminación de ventiladores **Aigo AR12** cuando no se cuenta con un controlador ARGB dedicado. Partiendo de eso se me ocurrió usar el RP2040 como una alternativa económica, programable y personalizable para enviar efectos de iluminación y comandos desde una aplicación de PC.
 
 ---
 
@@ -38,7 +38,7 @@ El RP2040 es una buena opción para este tipo de proyecto porque:
 * Puede controlar LEDs WS2812/ARGB sin depender completamente de la CPU.
 * Permite crear un controlador personalizado sin usar hardware ARGB propietario.
 
-Y la razón más importante: lo vi y me gusto :p
+Y la razón más importante: lo vi y me gustó :p
 ---
 
 ## Hardware utilizado
