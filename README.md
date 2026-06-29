@@ -37,7 +37,7 @@ El RP2040 es una buena opción para este tipo de proyecto porque:
 * Cuenta con módulos PIO, útiles para generar señales precisas.
 * Puede controlar LEDs WS2812/ARGB sin depender completamente de la CPU.
 * Permite crear un controlador personalizado sin usar hardware ARGB propietario.
-  Y la razón más importante: lo vi y me gusto :p
+Y la razón más importante: lo vi y me gusto :p
 ---
 
 ## Hardware utilizado
