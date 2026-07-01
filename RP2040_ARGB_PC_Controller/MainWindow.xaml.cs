@@ -1,6 +1,7 @@
 ﻿using HidSharp;
 using NAudio.Wave;
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Text;
@@ -12,6 +13,7 @@ using System.Windows.Data;
 using System.Windows.Documents;
 using System.Windows.Input;
 using System.Windows.Media;
+using System.Windows.Media.Effects;
 using System.Windows.Media.Imaging;
 using System.Windows.Navigation;
 using System.Windows.Shapes;
@@ -28,6 +30,7 @@ namespace PicoARGBControl
         private readonly DispatcherTimer _presenceTimer;
         private readonly string _configDir = System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Local", "PicoARGBController");
         private readonly string _configPath;
+        private readonly List<Button> _modeButtons = new();
 
         // Commands (matching firmware)
         private const byte CMD_PING = 0xAA;
@@ -35,14 +38,20 @@ namespace PicoARGBControl
         private const byte CMD_OFF = 0x04;         // ← CORREGIDO: OFF es 0x04
         private const byte CMD_SET_MODE = 0x05;    // ← CORREGIDO: SET_MODE es 0x05  
         private const byte CMD_MUSIC_LEVEL = 0x06;
+        private const byte CMD_SET_BRIGHTNESS = 0x07;
+        private const byte CMD_SET_EFFECT_SPEED = 0x08;
+        private const byte CMD_SET_MUSIC_STYLE = 0x09;
+        private const byte MAX_SAFE_BRIGHTNESS = 90;
 
         // Estado UI actual (modo y color seleccionados desde el panel izquierdo)
         private byte _selectedMode = 1; // 1=Static
         private System.Windows.Media.Color _selectedColor = Colors.Cyan;
 
         // Throttling para evitar flood HID en modo música
-        private DateTime _lastMusicColorSend = DateTime.MinValue;
-        private readonly TimeSpan _musicSendInterval = TimeSpan.FromMilliseconds(120); // enviar ~8-9 updates/s
+        private DateTime _lastMusicLevelSend = DateTime.MinValue;
+        private readonly TimeSpan _musicLevelSendInterval = TimeSpan.FromMilliseconds(55); // enviar ~18 updates/s
+        private AudioSourceKind _selectedAudioSource = AudioSourceKind.SystemAudio;
+        private bool _updatingColorUi;
 
 
         public MainWindow()
@@ -61,10 +70,19 @@ namespace PicoARGBControl
             try { tbStaticHex.Text = "#00ffff"; } catch { }
 
             // Populate modes panel with colorful buttons (borders will reflect selected color)
-            string[] modes = { "Static Color", "Rainbow", "Breathing", "Chase", "Music", "Cycle", "Off" };
+            (string Label, byte Mode)[] modes =
+            {
+                ("Static Color", 1),
+                ("Rainbow", 2),
+                ("Breathing", 3),
+                ("Chase", 4),
+                ("Audio Meter", 5),
+                ("Cycle", 6),
+                ("Off", 0),
+            };
             for (int i = 0; i < modes.Length; i++)
             {
-                var b = CreateModeButton(modes[i], (byte)(i + 1));
+                var b = CreateModeButton(modes[i].Label, modes[i].Mode);
                 ModesPanel.Children.Add(b);
             }
 
@@ -96,12 +114,20 @@ namespace PicoARGBControl
             };
 
             // Color inicial para Static
-            UpdateStaticPreview(_selectedColor);
+            SetSelectedColor(_selectedColor, updateHex: true, applyPreview: false);
+            SetSelectedAudioSource(_selectedAudioSource);
+            UpdateMusicTuningLabels();
+            if (lblBrightness != null) lblBrightness.Text = $"{GetBrightnessPercent()}%";
+            if (lblBrightnessFirmware != null) lblBrightnessFirmware.Text = $"FW {GetFirmwareBrightnessPercent()}%";
+            UpdateEffectSpeedLabel();
+            SetAudioStatus("Audio detenido");
             txtLog.Text = "";
 
             // Cargar configuración previa y aplicarla
             LoadConfigApplyToUI();
+            ShowParamsForMode(_selectedMode);
             ApplyFansFromUI();
+            UpdateModeButtonSelection();
 
             // Siempre activar el acento arcoíris en bordes y fondo de logo
             ApplyAccentFromUI();
@@ -123,21 +149,29 @@ namespace PicoARGBControl
         {
             var btn = new Button()
             {
-                Content = label,
-                Margin = new Thickness(6, 6, 6, 0),
-                Padding = new Thickness(10),
                 Tag = tag,
-                Width = 280,
-                Background = new SolidColorBrush(Color.FromArgb(20, 255, 255, 255)),
-                Foreground = Brushes.White,
+                HorizontalAlignment = HorizontalAlignment.Stretch,
+                Background = new SolidColorBrush(Color.FromRgb(17, 23, 35)),
+                BorderBrush = new SolidColorBrush(Color.FromRgb(40, 50, 72)),
+            };
+            btn.Content = new StackPanel
+            {
+                Orientation = Orientation.Vertical,
+                Children =
+                {
+                    new TextBlock { Text = label, Foreground = Brushes.White, FontWeight = FontWeights.SemiBold },
+                    new TextBlock { Text = ModeDescription(tag), Foreground = new SolidColorBrush(Color.FromRgb(152, 165, 189)), FontSize = 11, Margin = new Thickness(0, 2, 0, 0) }
+                }
             };
             // aplicar estilo neón si existe en recursos
-            try { btn.Style = (Style)FindResource("NeonButton"); } catch { }
+            try { btn.Style = (Style)FindResource("ModeButton"); } catch { }
+            _modeButtons.Add(btn);
             
             btn.Click += (s, e) =>
             {
                 byte mode = (byte)((Button)s).Tag;
                 _selectedMode = mode;
+                UpdateModeButtonSelection();
 
                 // Mostrar/ocultar subpaneles según el modo
                 ShowParamsForMode(mode);
@@ -156,7 +190,46 @@ namespace PicoARGBControl
             return btn;
         }
 
-        private async void PresenceTimer_Tick(object? sender, EventArgs e)
+        private string ModeDescription(byte mode) => mode switch
+        {
+            0 => "All LEDs off",
+            1 => "Solid color",
+            2 => "Animated spectrum",
+            3 => "Smooth pulse",
+            4 => "Moving trail",
+            5 => "Razer-style audio meter",
+            6 => "Continuous color shift",
+            _ => "Firmware mode"
+        };
+
+        private void UpdateModeButtonSelection()
+        {
+            foreach (var button in _modeButtons)
+            {
+                var isSelected = button.Tag is byte mode && mode == _selectedMode;
+                button.Background = new SolidColorBrush(isSelected ? Color.FromRgb(28, 40, 61) : Color.FromRgb(17, 23, 35));
+                button.BorderBrush = new SolidColorBrush(isSelected ? Color.FromRgb(0, 245, 212) : Color.FromRgb(40, 50, 72));
+            }
+        }
+
+        private void SetConnectionStatus(string status, string hint, Color accent, bool enabled)
+        {
+            lblStatus.Text = status;
+            lblStatus.Foreground = new SolidColorBrush(accent);
+            lblHint.Text = hint;
+            if (StatusDot != null)
+            {
+                StatusDot.Fill = new SolidColorBrush(accent);
+                StatusDot.Effect = new DropShadowEffect { Color = accent, BlurRadius = 10, ShadowDepth = 0, Opacity = 0.65 };
+            }
+            if (StatusPill != null)
+            {
+                StatusPill.BorderBrush = new SolidColorBrush(Color.FromArgb(190, accent.R, accent.G, accent.B));
+            }
+            btnConnect.IsEnabled = enabled;
+        }
+
+        private void PresenceTimer_Tick(object? sender, EventArgs e)
         {
             try
             {
@@ -165,8 +238,7 @@ namespace PicoARGBControl
                 if (!int.TryParse(vidHex, System.Globalization.NumberStyles.HexNumber, null, out int vid) ||
                     !int.TryParse(pidHex, System.Globalization.NumberStyles.HexNumber, null, out int pid))
                 {
-                    lblStatus.Text = "VID/PID inválidos";
-                    lblStatus.Foreground = Brushes.Orange;
+                    SetConnectionStatus("Error", "VID/PID inválidos", Color.FromRgb(255, 184, 77), true);
                     return;
                 }
 
@@ -176,27 +248,18 @@ namespace PicoARGBControl
                 // ✅ ACTUALIZACIÓN: Mostrar estados separados
                 if (connected)
                 {
-                    lblStatus.Text = "Conectado";
-                    lblStatus.Foreground = Brushes.LightGreen;
-                    lblHint.Text = "Comunicación activa con el dispositivo";
+                    SetConnectionStatus("Conectado", "Comunicación activa con el dispositivo", Color.FromRgb(0, 245, 144), true);
                     btnConnect.Content = "Desconectar";
-                    btnConnect.IsEnabled = true;
                 }
                 else if (present)
                 {
-                    lblStatus.Text = "Presente";
-                    lblStatus.Foreground = Brushes.LightBlue;
-                    lblHint.Text = "Dispositivo detectado - Listo para conectar";
+                    SetConnectionStatus("Presente", "Dispositivo detectado - Listo para conectar", Color.FromRgb(67, 165, 255), true);
                     btnConnect.Content = "Conectar";
-                    btnConnect.IsEnabled = true;
                 }
                 else
                 {
-                    lblStatus.Text = "No detectado";
-                    lblStatus.Foreground = Brushes.LightCoral;
-                    lblHint.Text = "Esperando controlador...";
+                    SetConnectionStatus("No detectado", "Esperando controlador...", Color.FromRgb(255, 93, 115), false);
                     btnConnect.Content = "Conectar";
-                    btnConnect.IsEnabled = false;
                 }
             }
             catch { }
@@ -227,16 +290,14 @@ namespace PicoARGBControl
             }
 
             btnConnect.IsEnabled = false;
-            lblStatus.Text = "Conectando...";
-            lblStatus.Foreground = Brushes.Yellow;
+            SetConnectionStatus("Conectando", "Abriendo dispositivo HID...", Color.FromRgb(255, 184, 77), false);
 
             try
             {
                 // Verificar presencia antes de conectar
                 if (!_hid.IsDevicePresent(vid, pid))
                 {
-                    lblStatus.Text = "Dispositivo no encontrado";
-                    lblStatus.Foreground = Brushes.LightCoral;
+                    SetConnectionStatus("No detectado", "Dispositivo no encontrado", Color.FromRgb(255, 93, 115), true);
                     btnConnect.IsEnabled = true;
                     Log("Dispositivo no detectado.");
                     return;
@@ -247,8 +308,7 @@ namespace PicoARGBControl
                 var ok = await Task.Run(() => _hid.Connect((int)vid, (int)pid));
                 if (!ok)
                 {
-                    lblStatus.Text = "Error de conexión";
-                    lblStatus.Foreground = Brushes.Orange;
+                    SetConnectionStatus("Error", "No se pudo abrir el dispositivo", Color.FromRgb(255, 184, 77), true);
                     btnConnect.IsEnabled = true;
                     Log("No se pudo abrir el dispositivo");
                     return;
@@ -279,17 +339,15 @@ namespace PicoARGBControl
 
                 if (pingSuccess)
                 {
-                    lblStatus.Text = "Conectado ✓";
-                    lblStatus.Foreground = Brushes.LightGreen;
-                    lblHint.Text = "Comunicación bidireccional activa";
+                    SetConnectionStatus("Conectado", "Comunicación bidireccional activa", Color.FromRgb(0, 245, 144), true);
                 }
                 else
                 {
-                    lblStatus.Text = "Conectado ⚠";
-                    lblStatus.Foreground = Brushes.Yellow;
-                    lblHint.Text = "Conectado pero sin respuesta del firmware";
+                    SetConnectionStatus("Conectado", "Sin PONG del firmware", Color.FromRgb(255, 184, 77), true);
                 }
 
+                SendBrightness(GetBrightnessPercent(), logIfDisconnected: false);
+                SendEffectSpeed(GetEffectSpeedPercent(), logIfDisconnected: false);
                 btnConnect.Content = "Desconectar";
             }
             catch (Exception ex)
@@ -308,9 +366,7 @@ namespace PicoARGBControl
         {
             _hid.Close();
             btnConnect.Content = "Conectar";
-            lblStatus.Text = "Desconectado";
-            lblStatus.Foreground = Brushes.LightCoral;
-            lblHint.Text = "Dispositivo desconectado";
+            SetConnectionStatus("Desconectado", "Dispositivo desconectado", Color.FromRgb(255, 93, 115), true);
             Log("🔌 Desconectado del dispositivo.");
             StopAudioCapture();
         }
@@ -323,7 +379,7 @@ namespace PicoARGBControl
                 return;
             }
             Log("🔴 Enviando OFF...");
-            _hid.SendCommand(CMD_OFF, null);
+            SendOff();
             Log("✅ Comando OFF enviado");
         }
 
@@ -334,8 +390,9 @@ namespace PicoARGBControl
             if (_hid.IsOpen)
             {
                 SendMode(mode);
-                if (mode == 1) SendHidColor(c.R, c.G, c.B);
-                Log($"📤 Enviado modo {mode} {(mode == 1 ? $"con color {c.R} {c.G} {c.B}" : "")}");
+                if (mode == 5) SendMusicStyle(UseIntensityColors(), logIfDisconnected: false);
+                if (mode == 1 || (mode == 5 && !UseIntensityColors())) SendHidColor(c.R, c.G, c.B);
+                Log($"📤 Enviado modo {mode} {(mode == 1 || (mode == 5 && !UseIntensityColors()) ? $"con color {c.R} {c.G} {c.B}" : "")}");
             }
             else
             {
@@ -346,90 +403,165 @@ namespace PicoARGBControl
         private void SendMode(byte mode)
         {
             if (!_hid.IsOpen) { Log("❌ No conectado"); return; }
+            if (mode == 0)
+            {
+                SendOff();
+                return;
+            }
+
             Log($"🔄 SET_MODE: {mode}");
             _hid.SendCommand(CMD_SET_MODE, new byte[] { mode });
             Log($"✅ Modo {mode} enviado");
         }
 
+        private void SendOff()
+        {
+            _hid.SendCommand(CMD_OFF, null);
+        }
+
         private void SendHidColor(byte r, byte g, byte b)
         {
             if (!_hid.IsOpen) { Log("❌ No conectado"); return; }
+            if (r == 0 && g == 0 && b == 0)
+            {
+                Log("⚫ Negro seleccionado: enviando OFF");
+                SendOff();
+                SendMusicLevel(0, logIfDisconnected: false);
+                ApplyFansFromUI();
+                return;
+            }
+
             Log($"🎨 SET_COLOR R:{r} G:{g} B:{b}");
             _hid.SendCommand(CMD_SET_COLOR, new byte[] { r, g, b });
             ApplyFansFromUI();
         }
 
+        private bool UseIntensityColors()
+        {
+            return chkIntensityColors?.IsChecked != false;
+        }
+
+        private void SendMusicStyle(bool useIntensityColors, bool logIfDisconnected = true)
+        {
+            if (!_hid.IsOpen)
+            {
+                if (logIfDisconnected) Log("⚠ Dispositivo no conectado");
+                return;
+            }
+
+            var style = useIntensityColors ? (byte)1 : (byte)0;
+            _hid.SendCommand(CMD_SET_MUSIC_STYLE, new byte[] { style });
+            Log(useIntensityColors
+                ? "🎚 Audio Wheel: colores por intensidad global"
+                : "🎚 Audio Meter: pulse color base");
+        }
+
         // Audio capture
         private void StartAudioCapture()
         {
-            if (_audio != null) return;
-            try
+            var source = GetSelectedAudioSource();
+            _selectedAudioSource = source;
+
+            if (source == AudioSourceKind.Disabled)
             {
-                _audio = new AudioAnalyzer();
-                _audio.Sensitivity = sldSensitivity.Value / 100.0;
-                _audio.MaxIntensity = (int)sldMaxIntensity.Value;
-                pbLevel.Maximum = _audio.MaxIntensity;
-                lblSensitivity.Text = $"{(int)sldSensitivity.Value}%";
-                lblMaxIntensity.Text = _audio.MaxIntensity.ToString();
-
-                _audio.LevelUpdated += (lvl) =>
-                {
-                    Dispatcher.BeginInvoke(() =>
-                    {
-                        pbLevel.Value = lvl;
-                        lblLevel.Text = ((int)lvl).ToString();
-                        if (GetSelectedMode() == 5)
-                        {
-                            double v = Math.Max(0.0, Math.Min(1.0, lvl / Math.Max(1.0, _audio.MaxIntensity)));
-                            try
-                            {
-                                FanTL?.SetAudioLevel(v);
-                                FanTR?.SetAudioLevel(v);
-                                FanBL?.SetAudioLevel(v);
-                                FanBR?.SetAudioLevel(v);
-                            }
-                            catch { }
-                        }
-                    });
-
-                    if (_hid.IsOpen)
-                    {
-                        _hid.SendCommand(CMD_MUSIC_LEVEL, new byte[] { (byte)Math.Min(100, (int)lvl) });
-
-                        if (GetSelectedMode() == 5)
-                        {
-                            var now = DateTime.UtcNow;
-                            if (now - _lastMusicColorSend >= _musicSendInterval)
-                            {
-                                _lastMusicColorSend = now;
-
-                                // Base color (el usuario define el tono guardado en _selectedColor o tb static color)
-                                var baseColor = (_selectedMode == 1) ? GetStaticColor() : _selectedColor;
-
-                                // Calcula intensidad: mínimo 25% (tenue) hasta 100%
-                                double intensity = 0.25 + (0.75 * Math.Max(0.0, Math.Min(1.0, lvl / Math.Max(1.0, _audio.MaxIntensity))));
-
-                                byte rs = (byte)Math.Min(255, (int)(baseColor.R * intensity));
-                                byte gs = (byte)Math.Min(255, (int)(baseColor.G * intensity));
-                                byte bs = (byte)Math.Min(255, (int)(baseColor.B * intensity));
-
-                                _hid.SendCommand(CMD_SET_COLOR, new byte[] { rs, gs, bs });
-                            }
-                        }
-                    }
-                };
-                _audio.Start();
-                Log("🎵 Captura de audio iniciada");
+                StopAudioCapture();
+                return;
             }
-            catch (Exception ex) { Log($"❌ Error audio: {ex.Message}"); }
+
+            StopAudioCapture(logStopped: false);
+
+            var analyzer = new AudioAnalyzer();
+            ApplyAudioSettings(analyzer);
+            _audio = analyzer;
+
+            analyzer.StatusChanged += status =>
+            {
+                Dispatcher.BeginInvoke(() => SetAudioStatus(status));
+            };
+            analyzer.AudioError += ex =>
+            {
+                Dispatcher.BeginInvoke(() =>
+                {
+                    SetAudioStatus("Error de audio");
+                    SendMusicLevel(0, logIfDisconnected: false);
+                    Log($"❌ Error audio: {ex.Message}");
+                });
+            };
+            analyzer.LevelUpdated += lvl => HandleAudioLevel(analyzer, lvl);
+
+            _ = Task.Run(() => analyzer.Start(source));
+            Log(source == AudioSourceKind.SystemAudio
+                ? "🎵 Escuchando audio del sistema"
+                : "🎙 Escuchando micrófono");
         }
 
-        private void StopAudioCapture()
+        private void StopAudioCapture(bool logStopped = true)
         {
-            _audio?.Stop();
+            var analyzer = _audio;
             _audio = null;
-            Dispatcher.Invoke(() => { pbLevel.Value = 0; lblLevel.Text = "0"; });
-            Log("🔇 Captura de audio detenida");
+            analyzer?.Dispose();
+
+            Dispatcher.Invoke(() =>
+            {
+                pbLevel.Value = 0;
+                lblLevel.Text = "0";
+                SetAudioStatus("Audio detenido");
+                SetFanAudioLevel(0);
+                SendMusicLevel(0, logIfDisconnected: false);
+            });
+
+            if (logStopped) {
+                Log("🔇 Captura de audio detenida");
+            }
+        }
+
+        private void HandleAudioLevel(AudioAnalyzer analyzer, float level)
+        {
+            var normalized = Math.Max(0.0, Math.Min(1.0, level / 100.0));
+            var musicLevel = ScaleMusicLevelToByte(level);
+
+            Dispatcher.BeginInvoke(() =>
+            {
+                pbLevel.Maximum = 100;
+                pbLevel.Value = Math.Min(level, 100);
+                lblLevel.Text = $"{musicLevel}";
+                if (GetSelectedMode() == 5) {
+                    SetFanAudioLevel(normalized);
+                }
+            });
+
+            if (_hid.IsOpen)
+            {
+                var now = DateTime.UtcNow;
+                if (now - _lastMusicLevelSend >= _musicLevelSendInterval)
+                {
+                    SendMusicLevel(musicLevel, logIfDisconnected: false);
+                }
+            }
+        }
+
+        private void SendMusicLevel(byte level, bool logIfDisconnected = true)
+        {
+            if (!_hid.IsOpen)
+            {
+                if (logIfDisconnected) Log("⚠ Dispositivo no conectado");
+                return;
+            }
+
+            _lastMusicLevelSend = DateTime.UtcNow;
+            _hid.SendCommand(CMD_MUSIC_LEVEL, new byte[] { level });
+        }
+
+        private void SetFanAudioLevel(double normalized)
+        {
+            try
+            {
+                FanTL?.SetAudioLevel(normalized);
+                FanTR?.SetAudioLevel(normalized);
+                FanBL?.SetAudioLevel(normalized);
+                FanBR?.SetAudioLevel(normalized);
+            }
+            catch { }
         }
 
         private void ChkMusic_Checked(object sender, RoutedEventArgs e) => StartAudioCapture();
@@ -437,47 +569,261 @@ namespace PicoARGBControl
 
         private void MusicTuning_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
         {
+            UpdateMusicTuningLabels();
             if (_audio != null)
             {
-                _audio.Sensitivity = sldSensitivity.Value / 100.0;
-                _audio.MaxIntensity = (int)sldMaxIntensity.Value;
-                pbLevel.Maximum = _audio.MaxIntensity;
-                lblSensitivity.Text = $"{(int)sldSensitivity.Value}%";
-                lblMaxIntensity.Text = _audio.MaxIntensity.ToString();
+                ApplyAudioSettings(_audio);
+                pbLevel.Maximum = 100;
             }
+        }
+
+        private void AudioSource_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            _selectedAudioSource = GetSelectedAudioSource();
+
+            if (_selectedAudioSource == AudioSourceKind.Disabled)
+            {
+                if (chkMusic != null) {
+                    chkMusic.IsChecked = false;
+                }
+                StopAudioCapture();
+                return;
+            }
+
+            if (chkMusic != null && chkMusic.IsChecked == true) {
+                StartAudioCapture();
+            } else {
+                SetAudioStatus("Audio detenido");
+            }
+        }
+
+        private AudioSourceKind GetSelectedAudioSource()
+        {
+            return cmbAudioSource?.SelectedIndex switch
+            {
+                1 => AudioSourceKind.SystemAudio,
+                2 => AudioSourceKind.Microphone,
+                _ => AudioSourceKind.Disabled,
+            };
+        }
+
+        private void SetSelectedAudioSource(AudioSourceKind source)
+        {
+            _selectedAudioSource = source;
+            if (cmbAudioSource == null) {
+                return;
+            }
+
+            cmbAudioSource.SelectedIndex = source switch
+            {
+                AudioSourceKind.SystemAudio => 1,
+                AudioSourceKind.Microphone => 2,
+                _ => 0,
+            };
+        }
+
+        private void ApplyAudioSettings(AudioAnalyzer analyzer)
+        {
+            analyzer.Sensitivity = Math.Max(0.05, sldSensitivity.Value / 100.0);
+            analyzer.MaxIntensity = Math.Max(1, Math.Min(100, (int)Math.Round(sldMaxIntensity.Value)));
+            analyzer.Smoothing = Math.Max(0.0, Math.Min(0.95, sldSmoothing.Value / 100.0));
+            analyzer.Decay = Math.Max(0.0, Math.Min(0.95, sldDecay.Value / 100.0));
+            analyzer.AutoGain = true;
+            analyzer.ResponseCurve = 0.82;
+        }
+
+        private void UpdateMusicTuningLabels()
+        {
+            if (lblSensitivity != null && sldSensitivity != null) lblSensitivity.Text = $"{(int)Math.Round(sldSensitivity.Value)}%";
+            if (lblMaxIntensity != null && sldMaxIntensity != null) lblMaxIntensity.Text = $"{(int)Math.Round(sldMaxIntensity.Value)}";
+            if (lblSmoothing != null && sldSmoothing != null) lblSmoothing.Text = $"{(int)Math.Round(sldSmoothing.Value)}%";
+            if (lblDecay != null && sldDecay != null) lblDecay.Text = $"{(int)Math.Round(sldDecay.Value)}%";
+        }
+
+        private void SetAudioStatus(string status)
+        {
+            if (lblAudioStatus == null) {
+                return;
+            }
+
+            lblAudioStatus.Text = status;
+            lblAudioStatus.Foreground = status switch
+            {
+                "Escuchando sistema" => new SolidColorBrush(Color.FromRgb(0, 245, 144)),
+                "Escuchando micrófono" => new SolidColorBrush(Color.FromRgb(67, 165, 255)),
+                "Error de audio" => new SolidColorBrush(Color.FromRgb(255, 93, 115)),
+                _ => new SolidColorBrush(Color.FromRgb(152, 165, 189)),
+            };
+        }
+
+        private byte ScaleMusicLevelToByte(float level)
+        {
+            double normalized = Math.Max(0.0, Math.Min(1.0, level / 100.0));
+            return (byte)Math.Round(normalized * 255.0);
+        }
+
+        private void MusicStyle_Changed(object sender, RoutedEventArgs e)
+        {
+            ShowParamsForMode(GetSelectedMode());
+            ApplyFansFromUI();
+            if (_hid.IsOpen && GetSelectedMode() == 5)
+            {
+                SendMusicStyle(UseIntensityColors(), logIfDisconnected: false);
+                if (!UseIntensityColors()) {
+                    var c = GetStaticColor();
+                    SendHidColor(c.R, c.G, c.B);
+                }
+            }
+        }
+
+        private byte GetBrightnessPercent()
+        {
+            try { return (byte)Math.Max(0, Math.Min(100, (int)Math.Round(sldBrightness.Value))); }
+            catch { return 100; }
+        }
+
+        private byte GetFirmwareBrightnessPercent()
+        {
+            return (byte)Math.Round(GetBrightnessPercent() * (MAX_SAFE_BRIGHTNESS / 100.0));
+        }
+
+        private void BrightnessSlider_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
+        {
+            byte brightness = GetBrightnessPercent();
+            if (lblBrightness != null) lblBrightness.Text = $"{brightness}%";
+            if (lblBrightnessFirmware != null) lblBrightnessFirmware.Text = $"FW {GetFirmwareBrightnessPercent()}%";
+            ApplyPreviewBrightness();
+            SendBrightness(brightness, logIfDisconnected: false);
+        }
+
+        private void SendBrightness(byte uiBrightness, bool logIfDisconnected = true)
+        {
+            if (!_hid.IsOpen)
+            {
+                if (logIfDisconnected) Log("⚠ Dispositivo no conectado");
+                return;
+            }
+
+            var firmwareBrightness = (byte)Math.Round(uiBrightness * (MAX_SAFE_BRIGHTNESS / 100.0));
+            _hid.SendCommand(CMD_SET_BRIGHTNESS, new byte[] { firmwareBrightness });
+            Log($"💡 SET_BRIGHTNESS: UI {uiBrightness}% -> FW {firmwareBrightness}%");
+        }
+
+        private byte GetEffectSpeedPercent()
+        {
+            try { return (byte)Math.Max(0, Math.Min(100, (int)Math.Round(sldEffectSpeed.Value))); }
+            catch { return 100; }
+        }
+
+        private void EffectSpeedSlider_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
+        {
+            UpdateEffectSpeedLabel();
+            SendEffectSpeed(GetEffectSpeedPercent(), logIfDisconnected: false);
+        }
+
+        private void UpdateEffectSpeedLabel()
+        {
+            if (lblEffectSpeed != null) lblEffectSpeed.Text = $"{GetEffectSpeedPercent()}%";
+        }
+
+        private void SendEffectSpeed(byte speed, bool logIfDisconnected = true)
+        {
+            if (!_hid.IsOpen)
+            {
+                if (logIfDisconnected) Log("⚠ Dispositivo no conectado");
+                return;
+            }
+
+            _hid.SendCommand(CMD_SET_EFFECT_SPEED, new byte[] { speed });
+            Log($"🏃 SET_EFFECT_SPEED: {speed}%");
+        }
+
+        private bool TryParseHexColor(string hex, out Color color)
+        {
+            color = default;
+            try
+            {
+                if (string.IsNullOrWhiteSpace(hex)) return false;
+                hex = hex.Trim();
+                if (!hex.StartsWith("#")) hex = "#" + hex;
+                var parsed = ColorConverter.ConvertFromString(hex);
+                if (parsed is not Color c) return false;
+
+                color = Color.FromRgb(c.R, c.G, c.B);
+                return true;
+            }
+            catch { return false; }
         }
 
         private Color ColorFromHex(string hex, Color fallback)
         {
-            try
-            {
-                if (string.IsNullOrWhiteSpace(hex)) return fallback;
-                hex = hex.Trim();
-                if (!hex.StartsWith("#")) hex = "#" + hex;
-                var c = (Color)ColorConverter.ConvertFromString(hex);
-                return c;
+            return TryParseHexColor(hex, out var color) ? color : fallback;
+        }
+
+        private void MarkHexValidity(bool isValid)
+        {
+            if (tbStaticHex == null) {
+                return;
             }
-            catch { return fallback; }
+
+            tbStaticHex.BorderBrush = isValid
+                ? (TryFindResource("PanelBorderBrush") as Brush ?? new SolidColorBrush(Color.FromRgb(38, 48, 68)))
+                : new SolidColorBrush(Color.FromRgb(255, 93, 115));
+            tbStaticHex.ToolTip = isValid ? "HEX color" : "HEX inválido. Se conserva el último color válido.";
         }
 
-        private Color GetStaticColor()
-        {
-            return ColorFromHex(tbStaticHex.Text, _selectedColor);
-        }
+        private Color GetStaticColor() => _selectedColor;
 
-        private void UpdateStaticPreview(Color c)
+        private void SetSelectedColor(Color color, bool updateHex, bool applyPreview = true)
         {
-            _selectedColor = c;
-            var preview = this.StaticColorPreview ?? (FindName("StaticColorPreview") as Border);
-            if (preview == null) { return; }
-            preview.Background = new SolidColorBrush(c);
+            _updatingColorUi = true;
+            _selectedColor = color;
+
+            if (sldRed != null) sldRed.Value = color.R;
+            if (sldGreen != null) sldGreen.Value = color.G;
+            if (sldBlue != null) sldBlue.Value = color.B;
+            if (lblRed != null) lblRed.Text = color.R.ToString();
+            if (lblGreen != null) lblGreen.Text = color.G.ToString();
+            if (lblBlue != null) lblBlue.Text = color.B.ToString();
+            if (updateHex && tbStaticHex != null) tbStaticHex.Text = $"#{color.R:X2}{color.G:X2}{color.B:X2}";
+            MarkHexValidity(true);
+
+            var preview = StaticColorPreview ?? (FindName("StaticColorPreview") as Border);
+            if (preview != null) {
+                preview.Background = new SolidColorBrush(color);
+            }
+
+            _updatingColorUi = false;
+
+            if (applyPreview) {
+                ApplyFansFromUI();
+            }
         }
 
         private void TbStaticHex_TextChanged(object sender, TextChangedEventArgs e)
         {
-            var c = GetStaticColor();
-            UpdateStaticPreview(c);
-            ApplyFansFromUI();
+            if (_updatingColorUi) return;
+            if (!TryParseHexColor(tbStaticHex.Text, out var c))
+            {
+                MarkHexValidity(false);
+                return;
+            }
+
+            SetSelectedColor(c, updateHex: false);
+        }
+
+        private void RgbSlider_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
+        {
+            if (_updatingColorUi || sldRed == null || sldGreen == null || sldBlue == null) return;
+            var c = Color.FromRgb((byte)sldRed.Value, (byte)sldGreen.Value, (byte)sldBlue.Value);
+            SetSelectedColor(c, updateHex: true);
+        }
+
+        private void QuickColor_Click(object sender, RoutedEventArgs e)
+        {
+            if (sender is Button button && button.Tag is string hex) {
+                SetSelectedColor(ColorFromHex(hex, _selectedColor), updateHex: true);
+            }
         }
 
         private void ApplyFans(byte mode, Color c)
@@ -486,6 +832,8 @@ namespace PicoARGBControl
             {
                 FanTL.Mode = mode; FanTR.Mode = mode; FanBL.Mode = mode; FanBR.Mode = mode;
                 FanTL.FanColor = c; FanTR.FanColor = c; FanBL.FanColor = c; FanBR.FanColor = c;
+                FanTL.UseIntensityColors = UseIntensityColors(); FanTR.UseIntensityColors = UseIntensityColors(); FanBL.UseIntensityColors = UseIntensityColors(); FanBR.UseIntensityColors = UseIntensityColors();
+                ApplyPreviewBrightness();
             }
             catch { }
         }
@@ -506,6 +854,11 @@ namespace PicoARGBControl
                     if (FanTR != null) { FanTR.FanColor = c; FanTR.Mode = mode; }
                     if (FanBL != null) { FanBL.FanColor = c; FanBL.Mode = mode; }
                     if (FanBR != null) { FanBR.FanColor = c; FanBR.Mode = mode; }
+                    if (FanTL != null) FanTL.UseIntensityColors = UseIntensityColors();
+                    if (FanTR != null) FanTR.UseIntensityColors = UseIntensityColors();
+                    if (FanBL != null) FanBL.UseIntensityColors = UseIntensityColors();
+                    if (FanBR != null) FanBR.UseIntensityColors = UseIntensityColors();
+                    ApplyPreviewBrightness();
                 }
                 catch (Exception ex)
                 {
@@ -622,14 +975,42 @@ namespace PicoARGBControl
         private void StopAccentPulse() { _accentPulse?.Stop(); _accentPulse = null; }
 
         // Config persistente
-        private class AppConfig { public byte Mode { get; set; } public byte R { get; set; } public byte G { get; set; } public byte B { get; set; } }
+        private class AppConfig
+        {
+            public byte Mode { get; set; }
+            public byte R { get; set; }
+            public byte G { get; set; }
+            public byte B { get; set; }
+            public byte Brightness { get; set; } = 100;
+            public byte EffectSpeed { get; set; } = 100;
+            public AudioSourceKind AudioSource { get; set; } = AudioSourceKind.SystemAudio;
+            public double Sensitivity { get; set; } = 200;
+            public double MaxIntensity { get; set; } = 80;
+            public double Smoothing { get; set; } = 45;
+            public double Decay { get; set; } = 82;
+            public bool UseIntensityColors { get; set; } = true;
+        }
         private void EnsureConfigDir() { try { if (!Directory.Exists(_configDir)) Directory.CreateDirectory(_configDir); } catch (Exception ex) { Log($"⚠ No se pudo crear config: {ex.Message}"); } }
         private void SaveConfig(byte mode, byte r, byte g, byte b)
         {
             try
             {
                 EnsureConfigDir();
-                var cfg = new AppConfig { Mode = mode, R = r, G = g, B = b };
+                var cfg = new AppConfig
+                {
+                    Mode = mode,
+                    R = r,
+                    G = g,
+                    B = b,
+                    Brightness = GetBrightnessPercent(),
+                    EffectSpeed = GetEffectSpeedPercent(),
+                    AudioSource = GetSelectedAudioSource(),
+                    Sensitivity = sldSensitivity.Value,
+                    MaxIntensity = sldMaxIntensity.Value,
+                    Smoothing = sldSmoothing.Value,
+                    Decay = sldDecay.Value,
+                    UseIntensityColors = UseIntensityColors(),
+                };
                 var json = JsonSerializer.Serialize(cfg, new JsonSerializerOptions { WriteIndented = true });
                 File.WriteAllText(_configPath, json);
                 Log($"💾 Config guardada en {_configPath}");
@@ -658,10 +1039,20 @@ namespace PicoARGBControl
                 _selectedMode = cfg.Mode;
                 var c = Color.FromRgb(cfg.R, cfg.G, cfg.B);
                 _selectedColor = c;
-                try { tbStaticHex.Text = $"#{c.R:X2}{c.G:X2}{c.B:X2}"; } catch { }
-                UpdateStaticPreview(c);
+                if (sldBrightness != null) sldBrightness.Value = Math.Max(0, Math.Min(100, (int)cfg.Brightness));
+                if (sldEffectSpeed != null) sldEffectSpeed.Value = Math.Max(0, Math.Min(100, (int)cfg.EffectSpeed));
+                if (sldSensitivity != null) sldSensitivity.Value = Math.Max(50, Math.Min(300, cfg.Sensitivity));
+                if (sldMaxIntensity != null) sldMaxIntensity.Value = Math.Max(50, Math.Min(100, cfg.MaxIntensity));
+                if (sldSmoothing != null) sldSmoothing.Value = Math.Max(0, Math.Min(95, cfg.Smoothing));
+                if (sldDecay != null) sldDecay.Value = Math.Max(0, Math.Min(95, cfg.Decay));
+                if (chkIntensityColors != null) chkIntensityColors.IsChecked = cfg.UseIntensityColors;
+                SetSelectedAudioSource(cfg.AudioSource);
+                UpdateMusicTuningLabels();
+                UpdateEffectSpeedLabel();
+                SetSelectedColor(c, updateHex: true, applyPreview: false);
                 ShowParamsForMode(_selectedMode);
                 ApplyFans(_selectedMode, c);
+                UpdateModeButtonSelection();
                 Log("✅ Config previa cargada");
             }
         }
@@ -685,7 +1076,17 @@ namespace PicoARGBControl
                 if (_hid.IsOpen && LoadConfig(out var cfg) && cfg != null)
                 {
                     SendMode(cfg.Mode);
-                    SendHidColor(cfg.R, cfg.G, cfg.B);
+                    SendBrightness(GetBrightnessPercent(), logIfDisconnected: false);
+                    SendEffectSpeed(GetEffectSpeedPercent(), logIfDisconnected: false);
+                    if (cfg.Mode == 5) {
+                        SendMusicStyle(cfg.UseIntensityColors, logIfDisconnected: false);
+                    }
+                    if (cfg.Mode == 1 || (cfg.Mode == 5 && !cfg.UseIntensityColors)) {
+                        SendHidColor(cfg.R, cfg.G, cfg.B);
+                    }
+                    if (cfg.Mode == 5 && GetSelectedAudioSource() == AudioSourceKind.Disabled) {
+                        SendMusicLevel(0, logIfDisconnected: false);
+                    }
                 }
             }
             catch { }
@@ -700,7 +1101,10 @@ namespace PicoARGBControl
             if (_hid.IsOpen)
             {
                 SendMode(mode);
-                if (mode == 1) SendHidColor(c.R, c.G, c.B);
+                SendBrightness(GetBrightnessPercent(), logIfDisconnected: false);
+                SendEffectSpeed(GetEffectSpeedPercent(), logIfDisconnected: false);
+                if (mode == 5) SendMusicStyle(UseIntensityColors(), logIfDisconnected: false);
+                if (mode == 1 || (mode == 5 && !UseIntensityColors())) SendHidColor(c.R, c.G, c.B);
             }
             else
             {
@@ -713,9 +1117,23 @@ namespace PicoARGBControl
         {
             try
             {
-                StaticParamsPanel.Visibility = (mode == 1) ? Visibility.Visible : Visibility.Collapsed;
+                StaticParamsPanel.Visibility = (mode == 1 || (mode == 5 && !UseIntensityColors())) ? Visibility.Visible : Visibility.Collapsed;
                 MusicParamsPanel.Visibility = (mode == 5) ? Visibility.Visible : Visibility.Collapsed;
-                NoParamsPanel.Visibility = (mode == 2 || mode == 3 || mode == 4 || mode == 6 || mode == 7) ? Visibility.Visible : Visibility.Collapsed;
+                NoParamsPanel.Visibility = (mode == 0 || mode == 2 || mode == 3 || mode == 4 || mode == 6) ? Visibility.Visible : Visibility.Collapsed;
+                UpdateModeButtonSelection();
+            }
+            catch { }
+        }
+
+        private void ApplyPreviewBrightness()
+        {
+            var brightness = GetBrightnessPercent() / 100.0;
+            try
+            {
+                if (FanTL != null) FanTL.PreviewBrightness = brightness;
+                if (FanTR != null) FanTR.PreviewBrightness = brightness;
+                if (FanBL != null) FanBL.PreviewBrightness = brightness;
+                if (FanBR != null) FanBR.PreviewBrightness = brightness;
             }
             catch { }
         }
@@ -723,7 +1141,7 @@ namespace PicoARGBControl
         protected override void OnClosed(EventArgs e)
         {
             _hid?.Close();
-            _audio?.Stop();
+            _audio?.Dispose();
             base.OnClosed(e);
         }
     }

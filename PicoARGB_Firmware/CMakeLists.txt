@@ -36,7 +36,11 @@ pico_sdk_init()
 # Add executable. Default name is the project name, version 0.1
 
 add_executable(PicoARGB_Firmware 
-    PicoARGB_Firmware.cpp
+    main.cpp
+    config.cpp
+    led_driver.cpp
+    effects.cpp
+    protocol.cpp
     ws2812.pio
     tusb_config.h
 )

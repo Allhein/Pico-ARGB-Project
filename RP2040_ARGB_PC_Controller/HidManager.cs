@@ -19,6 +19,7 @@ namespace PicoARGBControl
         private HidDevice? _device;
         private HidStream? _stream;
         private CancellationTokenSource? _cts;
+        private Task? _readTask;
         private Action<byte[]>? _onData;
         private StreamWriter? _logWriter;
 
@@ -54,6 +55,7 @@ namespace PicoARGBControl
             // try open
             if (!_device.TryOpen(out _stream)) return false;
             _cts = new CancellationTokenSource();
+            StartReading();
             return true;
         }
 
@@ -62,6 +64,7 @@ namespace PicoARGBControl
             try
             {
                 _cts?.Cancel();
+                try { _readTask?.Wait(200); } catch { }
                 _stream?.Close();
 
                 // Cerrar log file
@@ -73,6 +76,7 @@ namespace PicoARGBControl
             catch { }
             _stream = null;
             _device = null;
+            _readTask = null;
         }
 
         public async Task<bool> Ping(int timeoutMs = 500)
@@ -105,11 +109,8 @@ namespace PicoARGBControl
             }
 
             SetReadCallback(handler);
-            //SendCommand(0xAA, null); // PING
             try
             {
-                // 🔴 LOG DETALLADO del PING
-                LogSendCommand(0xAA, null, "PING");
                 SendCommand(0xAA, null);
 
                 // Esperar con timeout
@@ -131,14 +132,16 @@ namespace PicoARGBControl
 
         public void StartReading(Action<byte[]>? onData = null)
         {
-            _onData = onData;
+            if (onData != null) _onData = onData;
             if (_stream == null) return;
+            if (_readTask != null && !_readTask.IsCompleted) return;
+
             var token = _cts?.Token ?? CancellationToken.None;
-            Task.Run(async () =>
+            _readTask = Task.Run(async () =>
             {
-                var buf = new byte[_device?.GetMaxInputReportLength() ?? 64];
                 while (!token.IsCancellationRequested)
                 {
+                    var buf = new byte[_device?.GetMaxInputReportLength() ?? 64];
                     try
                     {
                         int read = await _stream.ReadAsync(buf, 0, buf.Length, token);
@@ -287,6 +290,9 @@ namespace PicoARGBControl
                 0x04 => "OFF",
                 0x05 => "SET_MODE",
                 0x06 => "MUSIC_LEVEL",
+                0x07 => "SET_BRIGHTNESS",
+                0x08 => "SET_EFFECT_SPEED",
+                0x09 => "SET_MUSIC_STYLE",
                 _ => "DESCONOCIDO"
             };
         }
